@@ -1,0 +1,431 @@
+---
+title: "Binary numerical classification - machine learning (mock dataset)"
+subtitle: Please comment for troubleshooting or if this module has bugs
+author: Ryan Ghannam - rghannam@mtu.edu
+date: July 20, 2017
+output:
+rmarkdown::html_document:
+    theme: lumen
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+* Initial model (Binary Numerical Classification)
+    + Takes dada2 pipeline output from raw fastq.
+    + Provides a DataFrame by which to run a classification model in R.
+    
+* Feature engineering
+    + Is not represented in this model as of yet (need real dataset).
+    + I'm assuming since our class can be expressed as a binary class using numerical. feature variables, we can also test this model below with a similar DataFrame, compliments of mlbench library in R.
+
+* Theory behind machine learning
+    + Theory of the various algorithms and accuracy metrics are left out of this
+    + Will focus on the code and what it's doing for our data.
+    
+* Excluded analysis
+    + This is a bit comprehensive so please let me know if there are questions.
+    + Certain libraries are hard to work with and require c++ compiling (may use library Rcpp) but will leave out certain algorithms due to over complexity.
+    + Leaving out xgboost which is rapidly making a name in the machine learning world.
+    + There's a lot of pre-predictive data analysis that's excluded from this, it generally gives a good idea of which features are important so that you may impute, manage variance bias tradeoff and tune for better model performance. Most of the variance management is done under the hood of the algorithm itself, doesn't need external calling.
+
+* Important: Notes
+    + This scripting in particular is variable.
+    + We're trying to make a script that's as plug and play as possible for future research projects and to turn the very complex task of machine learning into a user friendly pipeline accessible to the lab.
+
+* Keywords:
+    + rf = randomForest
+    + OOS = out of sample
+    + CV = cross validation
+    + ROC = receiver operating characteristic
+    + AUC = area under curve
+
+
+
+* Friendly reminder:
+    + I'm not a computer programmer or a data scientist and I'm only a few months into learning this stuff.
+
+
+
+
+
+
+
+# Loading Libraries
+
+You may have trouble installing these dependencies - refer to the CRAN packages and help tutorials if necessary, may need biocLite for a lot of these and there are many more packages that are masked from these.
+
+Clear your global environment (if using Rstudio).
+use if dataframes are currently in globalenvironment and you want to remove them, 
+use: rm(list=ls())
+
+```{r, echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+library(mlbench) 
+library(randomForest)
+library(caTools)
+library(ROCR)
+library(caret)
+library(caretEnsemble)
+```
+
+One of the most important libraries we use is caret.
+
+* caret
+    + Has hundreds of Machine Learning Algorithms using a common interface that wraps ~200 algorithms
+    + Can be used for: data splitting/sampling, feature selection, model tuning, ....
+    + Written by chief data scientist at RStudio.
+
+## 1. Loading initial dataframe
+Load the initial DataFrame (this is your initial data compilation of pipeline outputs or database that is required for training a model to work on future or out of sample data. This is data that will be collected at a later time and that we don't necessarily know the answers to.
+```{r}
+setwd('/users/ryang/mlmodel')
+seed = 41
+data(Sonar)
+```
+
+
+
+## ~~Partition data into various subsets~~
+When you initially read in your dataset, you create a **DataFrame** (matrix) with observations and variables, vars are columns, obs are rows. You generally have a **class (target response column) label** and that's what we're after.
+
+In the case of missing data, that's fine, there are ways to impute these types of missing data to reduce noise, but for now we don't need to worry about that.
+
+The importance of splitting data into train and test sets are for downstream code when we calculate cross-validated accuracy scores.
+
+Seeding:
+Introduce random seed for reproducible results e.g. splitting the same obs to the train set everytime etc.
+
+The output received from splitting, (inTrain) is a logical vector of true/false specifying the split of Sonar into train/test, specifying which records belong in the train, not necessary but helps understand which features went into, or didn't go into building the entire model.
+
+Normally, we would call this but since we don't have our real data, we are going to exemplify a mock dataset, and so we use a tripartition code instead.
+```{r}
+#   Not calling this - just example of a way to partition. We're using an alternative.
+#   set.seed(102)
+#   inTrain <- createDataPartition(y = Sonar$Class, p = .75, list = FALSE)
+#   trainData <- Sonar[ inTrain,]
+#   testData  <- Sonar[-inTrain,]
+```
+
+
+
+## 2. Partition data into various subsets(2)
+We are going to partition the data two ways here: we specify that we're taking the whole data and breaking it off at obs 150, so obs 1-150 is Sonar1, and obs 150-208 will be Sonar2. We do this for a reason because we're going to treat Sonar2 as OOS (out of sample) data, or future data that we haven't collected yet, it's easier because we have similar features that we've already trained the model on.
+```{r}
+breakpoint_row = 150
+Sonar1 <- head(Sonar, breakpoint_row)
+Sonar2 <- tail(Sonar, -breakpoint_row)
+```
+
+
+We will then delete the dependent var (class response or what we're after) in Sonar2, to mimic the future data, where we of course may not have answers to.
+
+So we will NOT have **true labels** for Sonar2, there are true labels for Sonar1 and that's how we're able to generate an ROC curve for the model validity.
+```{r}
+Sonar2$Class <- NULL
+```
+We want to then export data as CSV files so as to call them later on when we run our predictions etc.
+
+Whatever the working dir is from the above command will be the output.
+Notice, the Sonar2 won't have a 'Class' column.
+
+```{r}
+write.csv(Sonar1, '/users/ryang/mlmodel/Sonar1.csv', row.names = FALSE)
+write.csv(Sonar2, '/users/ryang/mlmodel/Sonar2.csv', row.names = FALSE)
+```
+
+We then want to load the data that's going to be used to train (fit) or validate the model.
+```{r}
+Sonar1 <- read.csv('/users/ryang/mlmodel/Sonar1.csv')
+```
+
+
+#### True partition
+We split this data into train/validation/test subsets.
+* **train** will be for fitting (training) various first-level (or standalone) models.
+* **validation** will be used for training the ensemble model.
+* **test**, although normally used as holdout data for class predictions, will ONLY be used for measuring a true generalization model performance of how a model does. (performance meaning accuracy and ROC/AUC).
+
+```{r}
+spec = c(train = .6, test = .2, val = .2)
+set.seed(seed)
+g = sample(cut(
+  seq(nrow(Sonar1)), 
+  nrow(Sonar1)*cumsum(c(0,spec)),
+  labels = names(spec)
+))
+
+splits <- split(Sonar1, g)
+
+trainData <- splits$train
+valData   <- splits$val
+testData  <- splits$test
+```
+
+
+
+## 3. Cross validation
+Here, we define our cross validation model training process for all of our first-level models, aka **standalone models** (because they aren't ensembled).
+
+Each model will be trained on three separate sets of **hyperparameters**, example would be in the case of *randomForest*, **ntry, mtree**, ....
+
+The best set of hyperparameters for each first-level model will be chosen by 5-fold CV score.
+
+**caret** comes into play heavily here.
+
+To extrapolate on our CV method, we use a **repeatedcv**, fitting 3 different models and in each model, report CV accuracy using 5 fold cross validation.
+
+This means every model accuracy is based on fitting 5 different models which is based on 5 different partitions of data, measuring OOS accuracy 5 different times and reporting an avg of the OOS.
+
+This is important because again, we're interested in OOS **(out of sample)** accuracy because our predictions are to be made on data that is technically out of sample, or future data that we may not have all of the answers to.
+
+**Cross validating (made easy) in this sense is a way of ultimately testing model accuracy**
+```{r}
+set.seed(seed)
+trainControl <- trainControl(method="repeatedcv", 
+                             number=5, 
+                             repeats=3, 
+                             search="random",
+                             classProbs=TRUE)
+```
+
+
+Here, we define first-level models we will train.
+(any model-specific parameters we want for all versions of a model type can be added here (e.g. verbose=FALSE for gbm) ).
+
+Adding multiple other models, some of these may be regression modeling or for an entirely different dataset but I'm just showing the importance of cross validating many different algorithms that are wrapped in caret.
+
+For the sake of simplicity, we are not putting **xgboost** in here, although we can if you have the c++ compiler necessary for installation.
+
+We refer to these as **1st level models** and we're training them as **standalone models**, we can either call these individually depending on the accuracy (which one is best for our dataset) or ensemble them and have them work together. (more on this later).
+```{r}
+modelTypes <- list(lda      = caretModelSpec(method="lda"),
+                   rpart    = caretModelSpec(method="rpart"),
+                   svmRadial= caretModelSpec(method="svmRadial"),
+                   logReg   = caretModelSpec(method="glm"),
+                   knn      = caretModelSpec(method="knn"),
+                   rf       = caretModelSpec(method="rf"),
+                   gbm      = caretModelSpec(method="gbm", verbose=FALSE) 
+)
+```
+
+
+
+## 4. Training these models (1st Level)
+We want to train all of the first level models, notice we're using train data because we don't touch the holdout datasets **(test/val)** until we're trying to call predictions, or building entirely separate models (ensembling them).
+
+Ultimately, we need to fit the model on train data and exclude the holdout test data because we're then going to test the accuracy of our model via calling a pred on the holdout set (the data that wasn't used in fitting the model, or, test data).
+
+This will predict a class and match it against an actual class, but you need actual class labels for this, meaning you'd need an initial dataset where you know the response, or true class labels. In the case of how we train our model with train data (before we gather new data that we don't have answers to) we have true class labels ~(R/M)~ here, or ~(BILGE/WATER)~.
+```{r, echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+set.seed(seed)
+trainedModels <-caretList(Class~., 
+                          data=trainData, 
+                          trControl=trainControl, 
+                          tuneList = modelTypes
+)
+```
+
+
+
+## 5. Model performance
+#### Display some cross valdiated accuracy metrics
+We want to provide some analytics to show the performance of the various models selected.
+
+A lot of times you will not know which model is best because it's highly dependent on features and overall dimensions of the dataset in general, so this is a nice way to generalize what the best standalone model will be, until of course you feel that using an ensemble of multiple models will increase the accuracy of your predictions.
+```{r}
+results <- resamples(trainedModels)
+summary(results)
+dotplot(results)
+```
+
+#### Figure 1. Accuracy/Kappa dotplot showing model performance
+
+Shows the tuning, or what it found the best hyperparameters to be **(mtry/ntree)** or varies dependent on the algorithm.
+```{r}
+trainedModels$rf
+```
+
+
+
+## 6. Variable importance
+Shows the variable importance for each model, this can help downstream analysis/model accuracy if you impute or focus on particular features that are being weighted more heavily by the majority of these algorithms.
+```{r}
+ldaVarImp   <- varImp(trainedModels$lda)
+rpartVarImp <- varImp(trainedModels$rpart)
+svmVarImp   <- varImp(trainedModels$svmRadial)
+logregVarImp<- varImp(trainedModels$logReg)
+knnVarImp   <- varImp(trainedModels$knn)
+rfVarImp    <- varImp(trainedModels$rf)
+gbmVarImp   <- varImp(trainedModels$gbm)
+
+rfVarImp
+```
+
+
+## 7. Produce AUC from ROC
+#### Performance metrics we're concerned with
+
+To summarize the performance of our classifier over all possible thresholds. We plot the True Positive Rate (y-axis) against the False Positive Rate (x-axis) as you vary the threshold for assigning observations to a given class.
+ 
+* ROC curve requirements:
+    + predictions and true-classes, as mentioned earlier. 
+    + First we generate preds on new data (which we have true classes for).
+
+* Cross validated accuracy scores will be calculated for out of sample data:
+    + caret doesn't just output an ROC curve.
+    + ROC is based on **predicted probability** of whether it believes an observation is considered the main class or other class (binary so one or other). It picks this by   itself and you have no control over it.
+
+
+ROC in the case of our problem requires a DataFrame with these **predicted probabilities** partitioned for each model. You'll see in the code when we generate ROC, which DataFrame is used. In this case, we're using **firstLevelTestPreds$rf** which means the predicted probabilities for how it considers each class IN the randomForest 1st-level-model.
+
+**Feel free to also read the files out to a directory so you may see why and how this code works.** Refer to line 139, change the file name to firstLevelTestPreds, or just view the DataFrame in Rstudio.
+
+Finally, the test data, or holdout data from the main initial DataFrame (where we         have class labels for) are being predicted and then going into an ROC.
+
+* CONFUSION: 
+    + The ROC that's being created is on a test set, so clearly this shows us the TRUE sample ROC performance, thus we're getting a TRUE out of sample area under the curve, AUC score.
+
+* WE CANNOT: 
+    + ROC curves allow threshold picking to convert class probabilities to concrete class predictions. 
+    + We generally want to avoid choosing this threshhold based on this 'test data ROC curve". However, this is fine because we can just choose a .5 50% threshold, rather than picking a threshold from a ROC generated from test, and turning around and predicting classes from a test set with this picked threshold. 
+    + This may be confusing but need not worry, we can go with .5 most of the time until it seriously needs to be addressed.
+
+If we decide that we would rather tune better and choose a probability threshold from ROC, we'll pick one from an ROC curve built from our train set, or from a validation set.
+```{r}
+firstLevelTestPreds <- as.data.frame(predict(trainedModels, newdata=testData))
+
+# Here, we show the ROC for the randomForest first level model.
+ROCRpred <- prediction(as.data.frame(firstLevelTestPreds$rf), testData$Class)
+ROCRperf <- performance(ROCRpred, "tpr", "fpr")
+plot(ROCRperf, main = "Receiver Operator Characteristic Curve", lwd = 3, colorize = TRUE, 
+     print.cutoffs.at=seq(0,1,by=0.1), text.adj=c(-0.2,1.7))
+```
+
+#### Figure 2. ROC curve for testData
+
+
+Here is the AUC from ROC
+
+AUC accuracy may be different dependent on seeds set earlier.
+```{r}
+testSetAUC_singleModel <- as.numeric(performance(ROCRpred, "auc")@y.values)
+
+testSetAUC_singleModel
+```
+
+## 8. ~~Ensembling - negligible~~
+The big model accuracy returns are within hyperparameter tuning/feature engineering, not ensembling in our case.
+
+Although these additional features of machine learning are applicable, a good model really depends on tuning parameters and feature engineering, so accuracy is highly reliant on how well you're able to manually engineer your dataset.
+
+Regardless, we're going to train our ensemble model.
+The ensemble uses **1st level model** predictions as its features.
+We will train the ensemble on valData.
+
+Similarly, we must first define our cross-validation method for the ensemble.
+
+caret: stackControl is currently same as trainControl, but have two separate objects just in case we wanted to modify one or the other.
+```{r}
+set.seed(seed)
+stackControl <- trainControl(method="repeatedcv", 
+                             number=5, repeats=3,
+                             savePredictions=TRUE, 
+                             search="random",
+                             classProbs=TRUE)
+
+
+# Since our ensemble uses 1st Level Model predictions as features, we have to generate these first level model predictions from our valData, which leads to train the ensemble. 
+firstLevelValPreds <-as.data.frame(predict(trainedModels, newdata=valData))
+
+# Train the ensemble model using valData.
+set.seed(seed)
+ensembleModel <- train(x=firstLevelValPreds, 
+                       y=valData$Class, 
+                       method='rf', 
+                       trControl=stackControl)
+
+# Inspecting the cross validated results with the ensemble object.
+ensembleModel
+```
+
+## 9. Accuracy of testData
+#### Confusion matrix for our standalone
+
+Notice that there is indeed a downside of partitioning the initial DataFrame into too     many subsets.
+
+We split it half for the sake of the model explanation, and then one half into test/train/validation.
+
+Also, here, we aren't accounting for the class imbalance in these partitions, e.g. more   'M' than 'R', more '0' then '1', more 'yes' than 'no', more 'offshore' than 'bilge'.
+
+So, if this is the case (which may be in ours unless we manipulate our training data) we may have a higher incidence of certain classes, which leads to class imbalance, which leads to a model predicting only one class 100% of the time.
+
+The more data we have the better - in every scenario, because we can distribute classes properly for more accurate modeling. Not having much data exposes our model to the aforementioned, causing problems.
+```{r}
+prob_thresh = 0.5
+rf_class_preds_test = ifelse(firstLevelTestPreds$rf<0.5, 'M', 'R')
+confusionMatrix(rf_class_preds_test, testData$Class)
+```
+
+Note the positive class assignment: 'M' for dictating our True -, True + etc..
+
+* Confusion matrix:
+    + 7=TP
+    + 2=FP
+    + 19=TN
+    + 2(left of 19)=FN
+      
+We look at the class distribution in our DataFrames.
+```{r}
+table(trainData$Class) # 37 Ms and 53 Rs in trainData - 41 % Ms
+table(valData$Class)   # 7 Ms and 23 Rs in valData - 23% Ms
+table(testData$Class)  # 9 Ms and 21 Rs in testData - 30% Ms
+```
+
+
+## 10. Reading in new data 
+#### Predicting the outcome of OOS data
+
+Refer to line 115, where we split Sonar into Sonar1/Sonar2.
+
+Here, we read in Sonar2 (notice it doesn't have a class column) which we're treating as out of sample data, we don't know have true class labels or know the answers to it.
+
+We are going to retrain what our tuning/cross validation found to be the the best standalone model.
+```{r}
+Sonar2 <- read.csv('/users/ryang/mlmodel/Sonar2.csv')
+rf_best_hyperparams <- trainedModels$rf$bestTune
+
+rf_refit <- train(Class ~ ., data = Sonar1, 
+                   method = "rf", 
+                   verbose = FALSE, 
+                   tuneGrid = rf_best_hyperparams
+)
+```
+
+
+This object is actually predicting on OOS (out of sample) data with the matrix Sonar2.
+```{r}
+rf_new_preds <- predict(rf_refit, newdata=Sonar2)
+rf_new_preds
+write.csv(rf_new_preds, '/users/ryang/mlmodel/rf_new_preds.csv', row.names = FALSE)
+```
+
+This tests that we're able to import new unseen data and use our established model to find important features and predict outcomes.
+
+Writing a csv calls a vector with predicted classes (what the model thinks to be the      answer). The observations or row numbers correspond to the observations in the initial dataset (the one we removed true class labels for).
+
+
+
+> Summary
+
+Each step is thoroughly explained in a user friendly manner.
+
+We created an initial binary classification model that uses numerical features. Similar to the dataset we will have once sequence results are obtained and we denoise them to assign sequence variants with relative abundances to our samples.
+
+**Accuracy of model chosen**: 86.67%
+
+Keep in mind there were indeed more accurate models, such as a standalone boosting model as in Figure 1. We display randomForest here.
+
+We should be able to discriminate class response quite accurately with field data given we manipulate the initial DataFrame to adhere to the algorithm. Time will tell, but we will test strenuously the various models (standalone and perhaps an ensemble), feature composition and ultimately model accuracy which best fits our problem.
+
+
